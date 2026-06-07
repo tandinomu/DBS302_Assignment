@@ -1,0 +1,380 @@
+version: "3.9"
+
+networks:
+  shopnest-net:
+    driver: bridge
+
+volumes:
+  mongo1-data:
+  mongo2-data:
+  mongo3-data:
+  redis-master-data:
+
+services:
+  # ─────────────────────────────────────────
+  # MongoDB Replica Set
+  # ─────────────────────────────────────────
+  mongo1:
+    image: mongo:7.0
+    hostname: mongo1
+    container_name: shopnest-mongo1
+    restart: unless-stopped
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo1-data:/data/db
+      - ./docker/mongo-keyfile:/etc/mongo-keyfile:ro
+    command: >
+      mongod
+      --replSet rs0
+      --keyFile /etc/mongo-keyfile
+      --bind_ip_all
+      --wiredTigerCacheSizeGB 0.5
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: admin
+      MONGO_INITDB_ROOT_PASSWORD: adminpass
+    networks:
+      - shopnest-net
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  mongo2:
+    image: mongo:7.0
+    hostname: mongo2
+    container_name: shopnest-mongo2
+    restart: unless-stopped
+    ports:
+      - "27018:27017"
+    volumes:
+      - mongo2-data:/data/db
+      - ./docker/mongo-keyfile:/etc/mongo-keyfile:ro
+    command: >
+      mongod
+      --replSet rs0
+      --keyFile /etc/mongo-keyfile
+      --bind_ip_all
+      --wiredTigerCacheSizeGB 0.5
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: admin
+      MONGO_INITDB_ROOT_PASSWORD: adminpass
+    networks:
+      - shopnest-net
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  mongo3:
+    image: mongo:7.0
+    hostname: mongo3
+    container_name: shopnest-mongo3
+    restart: unless-stopped
+    ports:
+      - "27019:27017"
+    volumes:
+      - mongo3-data:/data/db
+      - ./docker/mongo-keyfile:/etc/mongo-keyfile:ro
+    command: >
+      mongod
+      --replSet rs0
+      --keyFile /etc/mongo-keyfile
+      --bind_ip_all
+      --wiredTigerCacheSizeGB 0.5
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: admin
+      MONGO_INITDB_ROOT_PASSWORD: adminpass
+    networks:
+      - shopnest-net
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  mongo-init:
+    image: mongo:7.0
+    container_name: shopnest-mongo-init
+    restart: "no"
+    depends_on:
+      mongo1:
+        condition: service_healthy
+      mongo2:
+        condition: service_healthy
+      mongo3:
+        condition: service_healthy
+    networks:
+      - shopnest-net
+    entrypoint: >
+      bash -c "
+        echo 'Waiting for MongoDB nodes to be ready...' &&
+        sleep 5 &&
+        mongosh --host mongo1 --username admin --password adminpass --authenticationDatabase admin --eval '
+          var cfg = {
+            _id: \"rs0\",
+            members: [
+              { _id: 0, host: \"mongo1:27017\", priority: 2 },
+              { _id: 1, host: \"mongo2:27017\", priority: 1 },
+              { _id: 2, host: \"mongo3:27017\", priority: 1 }
+            ]
+          };
+          try {
+            rs.initiate(cfg);
+            print(\"Replica set initiated\");
+          } catch(e) {
+            if (e.codeName === \"AlreadyInitialized\") {
+              print(\"Replica set already initialized\");
+            } else {
+              throw e;
+            }
+          }
+        ' &&
+        echo 'Waiting for primary election...' &&
+        sleep 15 &&
+        mongosh --host mongo1 --username admin --password adminpass --authenticationDatabase admin --eval '
+          var maxRetries = 30;
+          for (var i = 0; i < maxRetries; i++) {
+            var status = rs.status();
+            var primary = status.members.find(m => m.stateStr === \"PRIMARY\");
+            if (primary) {
+              print(\"Primary elected: \" + primary.name);
+              break;
+            }
+            sleep(2000);
+          }
+          db = db.getSiblingDB(\"shopnest\");
+          db.createCollection(\"__init\");
+          print(\"shopnest database initialized\");
+        '
+      "
+
+  # ─────────────────────────────────────────
+  # Redis Master + Replicas
+  # ─────────────────────────────────────────
+  redis-master:
+    image: redis:7.2-alpine
+    hostname: redis-master
+    container_name: shopnest-redis-master
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-master-data:/data
+      - ./docker/redis.conf:/usr/local/etc/redis/redis.conf:ro
+    command: redis-server /usr/local/etc/redis/redis.conf
+    networks:
+      - shopnest-net
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis-replica1:
+    image: redis:7.2-alpine
+    hostname: redis-replica1
+    container_name: shopnest-redis-replica1
+    restart: unless-stopped
+    ports:
+      - "6380:6379"
+    command: >
+      redis-server
+      --replicaof redis-master 6379
+      --appendonly yes
+      --appendfsync everysec
+    depends_on:
+      redis-master:
+        condition: service_healthy
+    networks:
+      - shopnest-net
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis-replica2:
+    image: redis:7.2-alpine
+    hostname: redis-replica2
+    container_name: shopnest-redis-replica2
+    restart: unless-stopped
+    ports:
+      - "6381:6379"
+    command: >
+      redis-server
+      --replicaof redis-master 6379
+      --appendonly yes
+      --appendfsync everysec
+    depends_on:
+      redis-master:
+        condition: service_healthy
+    networks:
+      - shopnest-net
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # ─────────────────────────────────────────
+  # Redis Sentinel (quorum = 2)
+  # ─────────────────────────────────────────
+  redis-sentinel1:
+    image: redis:7.2-alpine
+    hostname: redis-sentinel1
+    container_name: shopnest-redis-sentinel1
+    restart: unless-stopped
+    ports:
+      - "26379:26379"
+    depends_on:
+      redis-master:
+        condition: service_healthy
+      redis-replica1:
+        condition: service_healthy
+      redis-replica2:
+        condition: service_healthy
+    networks:
+      - shopnest-net
+    entrypoint: >
+      sh -c "
+        echo 'sentinel resolve-hostnames yes' > /tmp/sentinel.conf &&
+        echo 'sentinel announce-hostnames yes' >> /tmp/sentinel.conf &&
+        echo 'sentinel monitor mymaster redis-master 6379 2' >> /tmp/sentinel.conf &&
+        echo 'sentinel down-after-milliseconds mymaster 5000' >> /tmp/sentinel.conf &&
+        echo 'sentinel failover-timeout mymaster 10000' >> /tmp/sentinel.conf &&
+        echo 'sentinel parallel-syncs mymaster 1' >> /tmp/sentinel.conf &&
+        echo 'port 26379' >> /tmp/sentinel.conf &&
+        redis-sentinel /tmp/sentinel.conf
+      "
+    healthcheck:
+      test: ["CMD", "redis-cli", "-p", "26379", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis-sentinel2:
+    image: redis:7.2-alpine
+    hostname: redis-sentinel2
+    container_name: shopnest-redis-sentinel2
+    restart: unless-stopped
+    ports:
+      - "26380:26379"
+    depends_on:
+      redis-master:
+        condition: service_healthy
+      redis-replica1:
+        condition: service_healthy
+      redis-replica2:
+        condition: service_healthy
+    networks:
+      - shopnest-net
+    entrypoint: >
+      sh -c "
+        echo 'sentinel resolve-hostnames yes' > /tmp/sentinel.conf &&
+        echo 'sentinel announce-hostnames yes' >> /tmp/sentinel.conf &&
+        echo 'sentinel monitor mymaster redis-master 6379 2' >> /tmp/sentinel.conf &&
+        echo 'sentinel down-after-milliseconds mymaster 5000' >> /tmp/sentinel.conf &&
+        echo 'sentinel failover-timeout mymaster 10000' >> /tmp/sentinel.conf &&
+        echo 'sentinel parallel-syncs mymaster 1' >> /tmp/sentinel.conf &&
+        echo 'port 26379' >> /tmp/sentinel.conf &&
+        redis-sentinel /tmp/sentinel.conf
+      "
+    healthcheck:
+      test: ["CMD", "redis-cli", "-p", "26379", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis-sentinel3:
+    image: redis:7.2-alpine
+    hostname: redis-sentinel3
+    container_name: shopnest-redis-sentinel3
+    restart: unless-stopped
+    ports:
+      - "26381:26379"
+    depends_on:
+      redis-master:
+        condition: service_healthy
+      redis-replica1:
+        condition: service_healthy
+      redis-replica2:
+        condition: service_healthy
+    networks:
+      - shopnest-net
+    entrypoint: >
+      sh -c "
+        echo 'sentinel resolve-hostnames yes' > /tmp/sentinel.conf &&
+        echo 'sentinel announce-hostnames yes' >> /tmp/sentinel.conf &&
+        echo 'sentinel monitor mymaster redis-master 6379 2' >> /tmp/sentinel.conf &&
+        echo 'sentinel down-after-milliseconds mymaster 5000' >> /tmp/sentinel.conf &&
+        echo 'sentinel failover-timeout mymaster 10000' >> /tmp/sentinel.conf &&
+        echo 'sentinel parallel-syncs mymaster 1' >> /tmp/sentinel.conf &&
+        echo 'port 26379' >> /tmp/sentinel.conf &&
+        redis-sentinel /tmp/sentinel.conf
+      "
+    healthcheck:
+      test: ["CMD", "redis-cli", "-p", "26379", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # ─────────────────────────────────────────
+  # Backend
+  # ─────────────────────────────────────────
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: shopnest-backend
+    restart: unless-stopped
+    ports:
+      - "5001:5000"
+    env_file:
+      - .env
+    depends_on:
+      mongo1:
+        condition: service_healthy
+      redis-master:
+        condition: service_healthy
+      redis-sentinel1:
+        condition: service_healthy
+    networks:
+      - shopnest-net
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:5000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  # ─────────────────────────────────────────
+  # Frontend
+  # ─────────────────────────────────────────
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: shopnest-frontend
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      NEXT_PUBLIC_API_URL: http://localhost:5001
+      API_URL: http://backend:5000
+    depends_on:
+      backend:
+        condition: service_healthy
+    networks:
+      - shopnest-net
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3000"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
